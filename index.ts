@@ -1695,10 +1695,6 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
               },
             },
             {
-              updateParagraphStyle: {
-                range: { startIndex: 0, endIndex: params.text.length + 2 },
-                style: { namedStyleType: "HEADER" },
-                fields: "namedStyleType",
               },
             },
           ],
