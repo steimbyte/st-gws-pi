@@ -147,7 +147,7 @@ function resolveGoogleApiUrl(path: string) {
 async function googleRequest(
   path: string,
   options: {
-    method?: "GET" | "POST" | "PUT" | "PATCH";
+    method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     query?: Record<string, string | number | boolean | undefined>;
     body?: JsonMap;
     signal?: AbortSignal;
@@ -434,7 +434,7 @@ function blockToMarkdown(block: JsonMap, lists: JsonMap | undefined, listState?:
       const count = (state.get(key) ?? 0) + 1;
       state.set(key, count);
 
-      for (const existingKey of state.keys()) {
+      for (const existingKey of Array.from(state.keys())) {
         if (!existingKey.startsWith(`${listId}:`)) continue;
         const level = Number(existingKey.split(":")[1]);
         if (Number.isFinite(level) && level > nestingLevel) state.delete(existingKey);
@@ -788,16 +788,19 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute() {
       const config = await readConfig();
+      const baseDetails = { configPath: CONFIG_PATH };
+
       if (!config) {
         return {
           content: [{ type: "text", text: `Not configured. Run /gws-setup. (${CONFIG_PATH})` }],
-          details: { configured: false as const, configPath: CONFIG_PATH, refreshToken: null, expiresAt: null, expired: null },
+          details: { ...baseDetails, configured: false, refreshToken: false, expiresAt: null as number | null, expired: null as boolean | null },
         };
       }
 
       const expiresAt = config.tokens.expiry_date ?? null;
       const refreshAvailable = !!config.tokens.refresh_token;
       const now = Date.now();
+      const isExpired = expiresAt ? now > expiresAt : null;
 
       return {
         content: [
@@ -812,13 +815,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
             ].join("\n"),
           },
         ],
-        details: {
-          configured: true as const,
-          configPath: CONFIG_PATH,
-          refreshToken: refreshAvailable,
-          expiresAt,
-          expired: expiresAt ? now > expiresAt : null,
-        },
+        details: { ...baseDetails, configured: true, refreshToken: refreshAvailable, expiresAt, expired: isExpired },
       };
     },
   });
@@ -986,9 +983,6 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       name: Type.Optional(Type.String({ description: "New file name (optional)" })),
     }),
     async execute(_toolCallId, params, signal) {
-      const body: JsonMap = {};
-      if (params.name) body.name = params.name;
-
       const copied = await googleRequest(`/drive/v3/files/${encodeURIComponent(params.fileId)}/copy`, {
         method: "POST",
         body: params.name ? { name: params.name } : {},
@@ -1355,8 +1349,9 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       });
 
       const replies = (data as JsonMap).replies as JsonMap[] | undefined;
-      const reply = (Array.isArray(replies) && replies.length > 0 ? replies[0] : {}) as JsonMap;
-      const sheetProps = reply.addSheet?.properties as JsonMap | undefined;
+      const reply = Array.isArray(replies) && replies.length > 0 ? replies[0] : {};
+      const addSheet = (reply as JsonMap).addSheet as JsonMap | undefined;
+      const sheetProps = typeof addSheet === "object" && addSheet !== null ? (addSheet.properties as JsonMap | undefined) : undefined;
       const sheetId = sheetProps?.sheetId;
 
       return {
@@ -1687,21 +1682,21 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       text: Type.String({ description: "Header text" }),
     }),
     async execute(_toolCallId, params, signal) {
+      // Insert header text at the beginning of the document (index 1)
+      // Note: Google Docs API doesn't support direct header insertion; this adds text styled as header at document start
       const data = await googleRequest(`/v1/documents/${encodeURIComponent(params.documentId)}:batchUpdate`, {
         method: "POST",
         body: {
           requests: [
             {
-              updateDocumentStyle: {
-                style: {
-                  customHeader: true,
-                },
-                fields: "customHeader",
+              insertText: {
+                location: { index: 1 },
+                text: params.text + "\n",
               },
             },
             {
               updateParagraphStyle: {
-                range: { startIndex: 0, endIndex: 1 },
+                range: { startIndex: 0, endIndex: params.text.length + 2 },
                 style: { namedStyleType: "HEADER" },
                 fields: "namedStyleType",
               },
@@ -1933,8 +1928,8 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, _params, signal) {
       const data = await googleRequest("/calendar/v3/users/me/calendarList", { query: { maxResults: 100 }, signal });
       const items = Array.isArray(data.items) ? data.items : [];
-      if (items.length === 0) return { content: [{ type: "text", text: "No calendars found." }], details: { count: 0 } };
       const lines = items.map((cal: JsonMap) => `${cal.summary || "(no summary)"} (ID: ${cal.id || ""})${cal.primary ? " [PRIMARY]" : ""}`);
+      if (items.length === 0) return { content: [{ type: "text", text: "No calendars found." }], details: { count: 0, calendars: [] as JsonMap[] } };
       return { content: [{ type: "text", text: `Calendars:\n${lines.join("\n")}` }], details: { count: items.length, calendars: items } };
     },
   });
@@ -1952,12 +1947,12 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, signal) {
       const calendarId = params.calendarId || "primary";
-      const query: Record<string, string | number> = { maxResults: params.maxResults ?? 25, singleEvents: true, orderBy: "startTime" };
+      const query: Record<string, string | number | boolean> = { maxResults: params.maxResults ?? 25, singleEvents: true, orderBy: "startTime" };
       if (params.timeMin) query.timeMin = params.timeMin;
       if (params.timeMax) query.timeMax = params.timeMax;
       const data = await googleRequest(`/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`, { query, signal });
       const items = Array.isArray(data.items) ? data.items : [];
-      if (items.length === 0) return { content: [{ type: "text", text: "No events found." }], details: { count: 0 } };
+      if (items.length === 0) return { content: [{ type: "text", text: "No events found." }], details: { count: 0, events: [] as JsonMap[] } };
       const lines = items.map((item: JsonMap) => {
         const start = (item.start as JsonMap)?.dateTime || (item.start as JsonMap)?.date || "";
         const end = (item.end as JsonMap)?.dateTime || (item.end as JsonMap)?.date || "";
@@ -1989,8 +1984,9 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       
       if (action === "delete") {
         if (!params.eventId) throw new Error("eventId required for delete");
+        // @ts-ignore - DELETE method not in typed union but supported by Google API
         await googleRequest(`/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(params.eventId)}`, { method: "DELETE", signal });
-        return { content: [{ type: "text", text: `Deleted event: ${params.eventId}` }], details: { action: "delete", eventId: params.eventId } };
+        return { content: [{ type: "text", text: `Deleted event: ${params.eventId}` }], details: { action: "delete" as string, eventId: params.eventId as string, event: undefined as unknown } } as any;
       }
 
       const eventBody: JsonMap = {};
@@ -2003,12 +1999,14 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
 
       if (action === "create") {
         const created = await googleRequest(`/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`, { method: "POST", body: eventBody, signal });
-        return { content: [{ type: "text", text: `Created: ${created.summary || params.summary}\nID: ${created.id}\nLink: ${created.htmlLink || ""}` }], details: { action, event: created } };
+        const newEventId = typeof created.id === "string" ? created.id : "";
+        return { content: [{ type: "text", text: `Created: ${created.summary || params.summary}\nID: ${newEventId}\nLink: ${created.htmlLink || ""}` }], details: { action: "create" as string, event: created, eventId: newEventId } } as any;
       }
 
       if (!params.eventId) throw new Error("eventId required for update");
       const updated = await googleRequest(`/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(params.eventId)}`, { method: "PUT", body: eventBody, signal });
-      return { content: [{ type: "text", text: `Updated: ${updated.summary || params.summary}\nID: ${updated.id}` }], details: { action, event: updated } };
+      const updatedEventId = typeof updated.id === "string" ? updated.id : params.eventId;
+      return { content: [{ type: "text", text: `Updated: ${updated.summary || params.summary}\nID: ${updatedEventId}` }], details: { action: "update" as string, event: updated, eventId: updatedEventId } } as any;
     },
   });
 
@@ -2022,7 +2020,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, _params, signal) {
       const data = await googleRequest("/v1/spaces", { query: { pageSize: 100 }, signal });
       const spaces = Array.isArray(data.spaces) ? data.spaces : [];
-      if (spaces.length === 0) return { content: [{ type: "text", text: "No Chat spaces found." }], details: { count: 0 } };
+      if (spaces.length === 0) return { content: [{ type: "text", text: "No Chat spaces found." }], details: { count: 0, spaces: [] as JsonMap[] } };
       const lines = spaces.map((s: JsonMap) => `${s.displayName || "Unnamed"} | ${s.name || ""}`);
       return { content: [{ type: "text", text: `Spaces:\n${lines.join("\n")}` }], details: { count: spaces.length, spaces } };
     },
@@ -2062,7 +2060,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
         signal,
       });
       const connections = Array.isArray(data.connections) ? data.connections : [];
-      if (connections.length === 0) return { content: [{ type: "text", text: "No contacts found." }], details: { count: 0 } };
+      if (connections.length === 0) return { content: [{ type: "text", text: "No contacts found." }], details: { count: 0, contacts: [] as JsonMap[] } };
       const lines = connections.map((p: JsonMap) => {
         const name = (p.names as JsonMap[])?.[0]?.displayName || "No name";
         const email = (p.emailAddresses as JsonMap[])?.[0]?.value || "";
