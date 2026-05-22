@@ -35,5 +35,8 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
   }
 }

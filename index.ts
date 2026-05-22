@@ -15,6 +15,10 @@ const OAUTH_SCOPE = [
   "https://www.googleapis.com/auth/documents",
   "https://www.googleapis.com/auth/presentations",
   "https://www.googleapis.com/auth/spreadsheets",
+  "https://www.googleapis.com/auth/calendar",
+  "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/chat.messages",
+  "https://www.googleapis.com/auth/contacts",
 ].join(" ");
 
 type OAuthTokens = {
@@ -134,6 +138,9 @@ function resolveGoogleApiUrl(path: string) {
   if (path.startsWith("/v1/documents")) return new URL(`https://docs.googleapis.com${path}`);
   if (path.startsWith("/v1/presentations")) return new URL(`https://slides.googleapis.com${path}`);
   if (path.startsWith("/v4/spreadsheets")) return new URL(`https://sheets.googleapis.com${path}`);
+  if (path.startsWith("/calendar/")) return new URL(`https://www.googleapis.com/calendar/v3${path.replace('/calendar', '')}`);
+  if (path.startsWith("/v1/spaces") || path.startsWith("/v1/") && path.includes("chat")) return new URL(`https://chat.googleapis.com${path}`);
+  if (path.startsWith("/v1/people")) return new URL(`https://people.googleapis.com${path}`);
   return new URL(`https://www.googleapis.com${path}`);
 }
 
@@ -145,7 +152,7 @@ async function googleRequest(
     body?: JsonMap;
     signal?: AbortSignal;
   } = {},
-) {
+): Promise<JsonMap> {
   const config = await getValidConfig(options.signal);
 
   const url = resolveGoogleApiUrl(path);
@@ -313,11 +320,12 @@ function escapeMdTableCell(text: string) {
 function applyInlineStyle(text: string, style: JsonMap | undefined): string {
   if (!text) return "";
   const trimmed = text.trim();
-  const left = text.slice(0, text.indexOf(trimmed));
-  const right = text.slice(text.indexOf(trimmed) + trimmed.length);
-  let core = escapeMdInline(trimmed || text);
-
   if (!trimmed) return escapeMdInline(text);
+
+  const trimmedIndex = text.indexOf(trimmed);
+  const left = text.slice(0, trimmedIndex);
+  const right = text.slice(trimmedIndex + trimmed.length);
+  let core = escapeMdInline(trimmed);
 
   const link = style?.link as JsonMap | undefined;
   const url = typeof link?.url === "string" ? link.url : undefined;
@@ -374,6 +382,7 @@ function tableToMarkdown(table: JsonMap, lists: JsonMap | undefined) {
     if (!Array.isArray(cells)) return [] as string[];
 
     return cells.map((cell) => {
+      if (!cell) return "";
       const content = cell.content as JsonMap[] | undefined;
       if (!Array.isArray(content)) return "";
       const chunks = content
@@ -749,7 +758,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
         };
 
         await saveConfig(config);
-        ctx.ui.notify(`Configuration saved: ${CONFIG_PATH}`, "success");
+        ctx.ui.notify(`Configuration saved: ${CONFIG_PATH}`, "info");
       } catch (error) {
         ctx.ui.notify(`Configuration failed: ${(error as Error).message}`, "error");
       }
@@ -764,7 +773,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
 
       try {
         await rm(CONFIG_PATH, { force: true });
-        ctx.ui.notify("Credentials deleted.", "success");
+        ctx.ui.notify("Credentials deleted.", "info");
       } catch (error) {
         ctx.ui.notify(`Deletion failed: ${(error as Error).message}`, "error");
       }
@@ -782,7 +791,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       if (!config) {
         return {
           content: [{ type: "text", text: `Not configured. Run /gws-setup. (${CONFIG_PATH})` }],
-          details: { configured: false, configPath: CONFIG_PATH },
+          details: { configured: false as const, configPath: CONFIG_PATH, refreshToken: null, expiresAt: null, expired: null },
         };
       }
 
@@ -804,7 +813,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
           },
         ],
         details: {
-          configured: true,
+          configured: true as const,
           configPath: CONFIG_PATH,
           refreshToken: refreshAvailable,
           expiresAt,
@@ -860,6 +869,10 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       outputPath: Type.Optional(Type.String({ description: "Optional local output path" })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      if (!params.fileId?.trim()) {
+        throw new Error("fileId is required and cannot be empty");
+      }
+      
       const metadata = await googleRequest(`/drive/v3/files/${encodeURIComponent(params.fileId)}`, {
         query: { fields: "id,name,mimeType" },
         signal,
@@ -900,7 +913,14 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const localPath = resolve(ctx.cwd, params.localPath.replace(/^@/, ""));
-      const bytes = await readFile(localPath);
+      
+      let bytes: Buffer;
+      try {
+        bytes = await readFile(localPath);
+      } catch (err) {
+        throw new Error(`Failed to read file: ${localPath} - ${(err as Error).message}`);
+      }
+      
       const driveName = params.name?.trim() || basename(localPath);
       const mimeType = params.mimeType?.trim() || "application/octet-stream";
 
@@ -996,6 +1016,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, signal) {
       await googleRequest(`/drive/v3/files/${encodeURIComponent(params.fileId)}`, {
+        // @ts-ignore - DELETE method not in typed union but supported by Google API
         method: "DELETE",
         signal,
       });
@@ -1019,10 +1040,20 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       type: Type.Optional(Type.String({ description: "Type: user, group, domain, anyone (default: user if email given, anyone otherwise)" })),
     }),
     async execute(_toolCallId, params, signal) {
-      const permission: JsonMap = {
-        type: (params.type as string) ?? (params.email ? "user" : "anyone"),
-        role: (params.role as string) ?? "reader",
-      };
+      const validRoles = ["reader", "writer", "commenter", "owner", "fileOrganizer"];
+      const validTypes = ["user", "group", "domain", "anyone"];
+      
+      const type = (params.type as string) ?? (params.email ? "user" : "anyone");
+      const role = (params.role as string) ?? "reader";
+      
+      if (!validTypes.includes(type)) {
+        throw new Error(`Invalid type: ${type}. Valid values: ${validTypes.join(", ")}`);
+      }
+      if (!validRoles.includes(role)) {
+        throw new Error(`Invalid role: ${role}. Valid values: ${validRoles.join(", ")}`);
+      }
+      
+      const permission: JsonMap = { type, role };
       if (params.email) {
         permission.emailAddress = params.email;
       }
@@ -1046,7 +1077,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
     description: "Search for files in Google Drive.",
     promptSnippet: "Search files by name or type in Google Drive.",
     parameters: Type.Object({
-      query: Type.String({ description: "Search query (e.g., 'name contains "report"')" }),
+      query: Type.String({ description: "Search query (e.g., 'name contains report')" }),
       pageSize: Type.Optional(Type.Integer({ description: "Max results (default: 20)" })),
     }),
     async execute(_toolCallId, params, signal) {
@@ -1261,8 +1292,9 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
         signal,
       });
 
-      const title = typeof data.properties?.title === "string" ? data.properties.title : "Unknown";
-      const locale = typeof data.properties?.locale === "string" ? data.properties.locale : "Unknown";
+      const props = data.properties as JsonMap | undefined;
+      const title = typeof props?.title === "string" ? String(props.title) : "Unknown";
+      const locale = typeof props?.locale === "string" ? String(props.locale) : "Unknown";
       const sheets = Array.isArray(data.sheets) ? data.sheets : [];
 
       const sheetInfo = sheets.map((sheet: JsonMap) => {
@@ -1322,7 +1354,8 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
         signal,
       });
 
-      const reply = Array.isArray(data.replies) ? data.replies[0] as JsonMap : {};
+      const replies = (data as JsonMap).replies as JsonMap[] | undefined;
+      const reply = (Array.isArray(replies) && replies.length > 0 ? replies[0] : {}) as JsonMap;
       const sheetProps = reply.addSheet?.properties as JsonMap | undefined;
       const sheetId = sheetProps?.sheetId;
 
@@ -1695,7 +1728,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       operations: Type.Array(Type.Any(), { description: "Array of operations to execute" }),
     }),
     async execute(_toolCallId, params, signal) {
-      const requests = params.operations.map((op: JsonMap) => {
+      const requests = (params.operations as JsonMap[]).map((op: JsonMap) => {
         const type = op.type as string;
         switch (type) {
           case "insertText":
@@ -1887,6 +1920,178 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
         content: [{ type: "text", text: `Replace complete: ${occurrencesChanged} item(s) changed` }],
         details: { presentationId: params.presentationId, occurrencesChanged },
       };
+    },
+  });
+
+  // Calendar tools
+  pi.registerTool({
+    name: "google_calendar_list",
+    label: "Google Calendar List",
+    description: "List all calendars accessible to the user.",
+    promptSnippet: "List Google Calendars",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, signal) {
+      const data = await googleRequest("/calendar/v3/users/me/calendarList", { query: { maxResults: 100 }, signal });
+      const items = Array.isArray(data.items) ? data.items : [];
+      if (items.length === 0) return { content: [{ type: "text", text: "No calendars found." }], details: { count: 0 } };
+      const lines = items.map((cal: JsonMap) => `${cal.summary || "(no summary)"} (ID: ${cal.id || ""})${cal.primary ? " [PRIMARY]" : ""}`);
+      return { content: [{ type: "text", text: `Calendars:\n${lines.join("\n")}` }], details: { count: items.length, calendars: items } };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_calendar_get_events",
+    label: "Google Calendar Get Events",
+    description: "Get events from a Google Calendar with optional time range filtering.",
+    promptSnippet: "Get calendar events with time range.",
+    parameters: Type.Object({
+      calendarId: Type.Optional(Type.String({ description: "Calendar ID (default: primary)" })),
+      timeMin: Type.Optional(Type.String({ description: "Start time (RFC3339)" })),
+      timeMax: Type.Optional(Type.String({ description: "End time (RFC3339)" })),
+      maxResults: Type.Optional(Type.Integer({ description: "Max events (default: 25)" })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const calendarId = params.calendarId || "primary";
+      const query: Record<string, string | number> = { maxResults: params.maxResults ?? 25, singleEvents: true, orderBy: "startTime" };
+      if (params.timeMin) query.timeMin = params.timeMin;
+      if (params.timeMax) query.timeMax = params.timeMax;
+      const data = await googleRequest(`/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`, { query, signal });
+      const items = Array.isArray(data.items) ? data.items : [];
+      if (items.length === 0) return { content: [{ type: "text", text: "No events found." }], details: { count: 0 } };
+      const lines = items.map((item: JsonMap) => {
+        const start = (item.start as JsonMap)?.dateTime || (item.start as JsonMap)?.date || "";
+        const end = (item.end as JsonMap)?.dateTime || (item.end as JsonMap)?.date || "";
+        return `"${item.summary || "No Title"}" | ${start} → ${end}`;
+      });
+      return { content: [{ type: "text", text: `Events:\n${lines.join("\n")}` }], details: { count: items.length, events: items } };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_calendar_manage_event",
+    label: "Google Calendar Manage Event",
+    description: "Create, update, or delete calendar events.",
+    promptSnippet: "Create/update/delete calendar events.",
+    parameters: Type.Object({
+      action: Type.String({ description: "Action: create, update, or delete" }),
+      calendarId: Type.Optional(Type.String({ description: "Calendar ID (default: primary)" })),
+      eventId: Type.Optional(Type.String({ description: "Event ID (for update/delete)" })),
+      summary: Type.Optional(Type.String({ description: "Event title" })),
+      startTime: Type.Optional(Type.String({ description: "Start time (RFC3339 or YYYY-MM-DD)" })),
+      endTime: Type.Optional(Type.String({ description: "End time (RFC3339 or YYYY-MM-DD)" })),
+      description: Type.Optional(Type.String({ description: "Event description" })),
+      attendees: Type.Optional(Type.Array(Type.String(), { description: "Attendee emails" })),
+      addGoogleMeet: Type.Optional(Type.Boolean({ description: "Add Google Meet link" })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const calendarId = params.calendarId || "primary";
+      const action = params.action.toLowerCase();
+      
+      if (action === "delete") {
+        if (!params.eventId) throw new Error("eventId required for delete");
+        await googleRequest(`/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(params.eventId)}`, { method: "DELETE", signal });
+        return { content: [{ type: "text", text: `Deleted event: ${params.eventId}` }], details: { action: "delete", eventId: params.eventId } };
+      }
+
+      const eventBody: JsonMap = {};
+      if (params.summary) eventBody.summary = params.summary;
+      if (params.description) eventBody.description = params.description;
+      if (params.startTime) eventBody.start = params.startTime.includes("T") ? { dateTime: params.startTime } : { date: params.startTime };
+      if (params.endTime) eventBody.end = params.endTime.includes("T") ? { dateTime: params.endTime } : { date: params.endTime };
+      if (params.attendees?.length) eventBody.attendees = params.attendees.map(e => ({ email: e }));
+      if (params.addGoogleMeet) eventBody.conferenceData = { createRequest: { requestId: crypto.randomUUID(), conferenceSolutionKey: { type: "hangoutsMeet" } } };
+
+      if (action === "create") {
+        const created = await googleRequest(`/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`, { method: "POST", body: eventBody, signal });
+        return { content: [{ type: "text", text: `Created: ${created.summary || params.summary}\nID: ${created.id}\nLink: ${created.htmlLink || ""}` }], details: { action, event: created } };
+      }
+
+      if (!params.eventId) throw new Error("eventId required for update");
+      const updated = await googleRequest(`/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(params.eventId)}`, { method: "PUT", body: eventBody, signal });
+      return { content: [{ type: "text", text: `Updated: ${updated.summary || params.summary}\nID: ${updated.id}` }], details: { action, event: updated } };
+    },
+  });
+
+  // Chat tools
+  pi.registerTool({
+    name: "google_chat_list_spaces",
+    label: "Google Chat List Spaces",
+    description: "List Google Chat spaces.",
+    promptSnippet: "List Chat spaces.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, signal) {
+      const data = await googleRequest("/v1/spaces", { query: { pageSize: 100 }, signal });
+      const spaces = Array.isArray(data.spaces) ? data.spaces : [];
+      if (spaces.length === 0) return { content: [{ type: "text", text: "No Chat spaces found." }], details: { count: 0 } };
+      const lines = spaces.map((s: JsonMap) => `${s.displayName || "Unnamed"} | ${s.name || ""}`);
+      return { content: [{ type: "text", text: `Spaces:\n${lines.join("\n")}` }], details: { count: spaces.length, spaces } };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_chat_send_message",
+    label: "Google Chat Send Message",
+    description: "Send a message to a Google Chat space.",
+    promptSnippet: "Send message to Chat space.",
+    parameters: Type.Object({
+      spaceId: Type.String({ description: "Chat space ID (e.g. spaces/xxx)" }),
+      messageText: Type.String({ description: "Message text" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const sent = await googleRequest(`/v1/spaces/${encodeURIComponent(params.spaceId)}/messages`, {
+        method: "POST",
+        body: { text: params.messageText },
+        signal,
+      });
+      return { content: [{ type: "text", text: `Sent to ${params.spaceId}\nMessage ID: ${sent.name || ""}` }], details: { spaceId: params.spaceId, messageId: sent.name } };
+    },
+  });
+
+  // Contacts tools
+  pi.registerTool({
+    name: "google_contacts_list",
+    label: "Google Contacts List",
+    description: "List contacts for the authenticated user.",
+    promptSnippet: "List Google Contacts.",
+    parameters: Type.Object({
+      pageSize: Type.Optional(Type.Integer({ description: "Max contacts (default: 100)" })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest("/v1/people/me/connections", {
+        query: { personFields: "names,emailAddresses,phoneNumbers", pageSize: params.pageSize ?? 100 },
+        signal,
+      });
+      const connections = Array.isArray(data.connections) ? data.connections : [];
+      if (connections.length === 0) return { content: [{ type: "text", text: "No contacts found." }], details: { count: 0 } };
+      const lines = connections.map((p: JsonMap) => {
+        const name = (p.names as JsonMap[])?.[0]?.displayName || "No name";
+        const email = (p.emailAddresses as JsonMap[])?.[0]?.value || "";
+        const phone = (p.phoneNumbers as JsonMap[])?.[0]?.value || "";
+        return `${name}${email ? ` | ${email}` : ""}${phone ? ` | ${phone}` : ""}`;
+      });
+      return { content: [{ type: "text", text: `Contacts:\n${lines.join("\n")}` }], details: { count: connections.length, contacts: connections } };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_contacts_get",
+    label: "Google Contacts Get",
+    description: "Get detailed contact information.",
+    promptSnippet: "Get contact details by ID.",
+    parameters: Type.Object({
+      contactId: Type.String({ description: "Contact ID" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      let resourceName = params.contactId.startsWith("people/") ? params.contactId : `people/${params.contactId}`;
+      const person = await googleRequest(`/v1/${encodeURIComponent(resourceName)}`, {
+        query: { personFields: "names,emailAddresses,phoneNumbers,organizations,addresses" },
+        signal,
+      });
+      const name = (person.names as JsonMap[])?.[0]?.displayName || "No name";
+      const emails = (person.emailAddresses as JsonMap[])?.map(e => e.value).join(", ") || "";
+      const phones = (person.phoneNumbers as JsonMap[])?.map(p => p.value).join(", ") || "";
+      const org = (person.organizations as JsonMap[])?.[0]?.name || "";
+      return { content: [{ type: "text", text: `${name}\nEmail: ${emails}\nPhone: ${phones}\nOrganization: ${org}` }], details: { contact: person } };
     },
   });
 
