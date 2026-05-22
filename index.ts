@@ -957,6 +957,148 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "google_drive_copy",
+    label: "Google Drive Copy File",
+    description: "Copy a file in Google Drive.",
+    promptSnippet: "Duplicate a file in Google Drive.",
+    parameters: Type.Object({
+      fileId: Type.String({ description: "File ID to copy" }),
+      name: Type.Optional(Type.String({ description: "New file name (optional)" })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const body: JsonMap = {};
+      if (params.name) body.name = params.name;
+
+      const copied = await googleRequest(`/drive/v3/files/${encodeURIComponent(params.fileId)}/copy`, {
+        method: "POST",
+        body: params.name ? { name: params.name } : {},
+        query: { fields: "id,name,webViewLink" },
+        signal,
+      });
+
+      const newId = typeof copied.id === "string" ? copied.id : "";
+      const newName = typeof copied.name === "string" ? copied.name : params.name ?? "copied file";
+
+      return {
+        content: [{ type: "text", text: `File copied\n- original: ${params.fileId}\n- copy: ${newName}\n- id: ${newId}` }],
+        details: { originalFileId: params.fileId, newFileId: newId, name: newName },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_drive_delete",
+    label: "Google Drive Delete File",
+    description: "Move a file to trash in Google Drive.",
+    promptSnippet: "Delete (trash) a file in Google Drive.",
+    parameters: Type.Object({
+      fileId: Type.String({ description: "File ID to delete" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      await googleRequest(`/drive/v3/files/${encodeURIComponent(params.fileId)}`, {
+        method: "DELETE",
+        signal,
+      });
+
+      return {
+        content: [{ type: "text", text: `Deleted file: ${params.fileId}` }],
+        details: { fileId: params.fileId },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_drive_share",
+    label: "Google Drive Share",
+    description: "Share a file with specific email or make it public.",
+    promptSnippet: "Share a Google Drive file with permissions.",
+    parameters: Type.Object({
+      fileId: Type.String({ description: "File ID to share" }),
+      email: Type.Optional(Type.String({ description: "Email to share with (optional for public)" })),
+      role: Type.Optional(Type.String({ description: "Role: reader, writer, commenter (default: reader)" })),
+      type: Type.Optional(Type.String({ description: "Type: user, group, domain, anyone (default: user if email given, anyone otherwise)" })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const permission: JsonMap = {
+        type: (params.type as string) ?? (params.email ? "user" : "anyone"),
+        role: (params.role as string) ?? "reader",
+      };
+      if (params.email) {
+        permission.emailAddress = params.email;
+      }
+
+      const result = await googleRequest(`/drive/v3/files/${encodeURIComponent(params.fileId)}/permissions`, {
+        method: "POST",
+        body: permission,
+        signal,
+      });
+
+      return {
+        content: [{ type: "text", text: `Shared file: ${params.fileId}\n- type: ${permission.type}\n- role: ${permission.role}${params.email ? `\n- email: ${params.email}` : ""}` }],
+        details: { fileId: params.fileId, permissionId: result.id, type: permission.type, role: permission.role },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_drive_search",
+    label: "Google Drive Search",
+    description: "Search for files in Google Drive.",
+    promptSnippet: "Search files by name or type in Google Drive.",
+    parameters: Type.Object({
+      query: Type.String({ description: "Search query (e.g., 'name contains "report"')" }),
+      pageSize: Type.Optional(Type.Integer({ description: "Max results (default: 20)" })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest("/drive/v3/files", {
+        query: {
+          q: params.query,
+          pageSize: params.pageSize ?? 20,
+          fields: "files(id,name,mimeType,modifiedTime)",
+          orderBy: "modifiedTime desc",
+        },
+        signal,
+      });
+
+      const files = Array.isArray(data.files) ? data.files : [];
+      const lines = files.map((file: JsonMap, idx: number) => {
+        return `${idx + 1}. ${file.name} (${file.mimeType})\n   ID: ${file.id}`;
+      });
+
+      return {
+        content: [{ type: "text", text: lines.length > 0 ? lines.join("\n") : "No files found." }],
+        details: { count: files.length, files },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_drive_get_permissions",
+    label: "Google Drive Get Permissions",
+    description: "Get sharing permissions of a file.",
+    promptSnippet: "List who has access to a Google Drive file.",
+    parameters: Type.Object({
+      fileId: Type.String({ description: "File ID" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest(`/drive/v3/files/${encodeURIComponent(params.fileId)}/permissions`, {
+        query: { fields: "permissions(id,type,role,emailAddress)" },
+        signal,
+      });
+
+      const perms = Array.isArray(data.permissions) ? data.permissions : [];
+      const lines = perms.map((p: JsonMap) => {
+        return `- ${p.type}: ${p.emailAddress ?? "(anyone)"} - ${p.role}`;
+      });
+
+      return {
+        content: [{ type: "text", text: lines.length > 0 ? `Permissions:\n${lines.join("\n")}` : "No permissions found." }],
+        details: { fileId: params.fileId, permissions: perms },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "google_sheets_create",
     label: "Google Sheets Create",
     description: "Create a spreadsheet and optionally write a header row.",
@@ -1064,6 +1206,156 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: `Sheet update complete\n- range: ${updatedRange}\n- rows: ${updatedRows}` }],
         details: { spreadsheetId: params.spreadsheetId, updatedRange, updatedRows },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_sheets_list",
+    label: "Google Sheets List",
+    description: "List all Google Spreadsheets accessible to the user.",
+    promptSnippet: "List all Google Spreadsheets the user has access to.",
+    parameters: Type.Object({
+      pageSize: Type.Optional(Type.Integer({ description: "Maximum number of results (default: 25)" })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest("/drive/v3/files", {
+        query: {
+          q: "mimeType='application/vnd.google-apps.spreadsheet'",
+          pageSize: params.pageSize ?? 25,
+          fields: "files(id,name,modifiedTime,webViewLink)",
+          orderBy: "modifiedTime desc",
+        },
+        signal,
+      });
+
+      const files = Array.isArray(data.files) ? (data.files as JsonMap[]) : [];
+      const lines = files.map((file, idx) => {
+        const id = typeof file.id === "string" ? file.id : "";
+        const name = typeof file.name === "string" ? file.name : "(no name)";
+        const modified = typeof file.modifiedTime === "string" ? file.modifiedTime : "";
+        const link = typeof file.webViewLink === "string" ? file.webViewLink : "";
+        return `${idx + 1}. ${name}\n   - id: ${id}\n   - modified: ${modified}\n   - link: ${link}`;
+      });
+
+      return {
+        content: [{ type: "text", text: lines.length > 0 ? lines.join("\n") : "No spreadsheets found." }],
+        details: { count: files.length, files },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_sheets_get_info",
+    label: "Google Sheets Get Info",
+    description: "Get information about a spreadsheet including its sheets.",
+    promptSnippet: "Get spreadsheet metadata including sheet names and grid size.",
+    parameters: Type.Object({
+      spreadsheetId: Type.String({ description: "Spreadsheet ID" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest(`/v4/spreadsheets/${encodeURIComponent(params.spreadsheetId)}`, {
+        query: {
+          fields: "spreadsheetId,properties(title,locale),sheets(properties(title,sheetId,gridProperties(rowCount,columnCount)))",
+        },
+        signal,
+      });
+
+      const title = typeof data.properties?.title === "string" ? data.properties.title : "Unknown";
+      const locale = typeof data.properties?.locale === "string" ? data.properties.locale : "Unknown";
+      const sheets = Array.isArray(data.sheets) ? data.sheets : [];
+
+      const sheetInfo = sheets.map((sheet: JsonMap) => {
+        const props = sheet.properties as JsonMap | undefined;
+        const grid = props?.gridProperties as JsonMap | undefined;
+        return `- "${props?.title}" (ID: ${props?.sheetId}) | Size: ${grid?.rowCount ?? "?"}x${grid?.columnCount ?? "?"}`;
+      }).join("\n");
+
+      return {
+        content: [{ type: "text", text: `Spreadsheet: ${title} (ID: ${params.spreadsheetId})\nLocale: ${locale}\n\nSheets (${sheets.length}):\n${sheetInfo}` }],
+        details: { title, locale, sheetCount: sheets.length, sheets },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_sheets_clear",
+    label: "Google Sheets Clear",
+    description: "Clear values from a range in Google Sheets.",
+    promptSnippet: "Clear cell values from a spreadsheet range.",
+    parameters: Type.Object({
+      spreadsheetId: Type.String({ description: "Spreadsheet ID" }),
+      range: Type.String({ description: "A1 range to clear (e.g. Sheet1!A1:D10)" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest(`/v4/spreadsheets/${encodeURIComponent(params.spreadsheetId)}/values/${encodeURIComponent(params.range)}:clear`, {
+        method: "POST",
+        signal,
+      });
+
+      return {
+        content: [{ type: "text", text: `Cleared range: ${data.clearedRange ?? params.range}` }],
+        details: { spreadsheetId: params.spreadsheetId, clearedRange: data.clearedRange },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_sheets_create_sheet",
+    label: "Google Sheets Create Sheet",
+    description: "Create a new sheet/tab in an existing spreadsheet.",
+    promptSnippet: "Add a new sheet tab to an existing spreadsheet.",
+    parameters: Type.Object({
+      spreadsheetId: Type.String({ description: "Spreadsheet ID" }),
+      title: Type.String({ description: "Name of the new sheet/tab" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest(`/v4/spreadsheets/${encodeURIComponent(params.spreadsheetId)}:batchUpdate`, {
+        method: "POST",
+        body: {
+          requests: [{
+            addSheet: {
+              properties: { title: params.title },
+            },
+          }],
+        },
+        signal,
+      });
+
+      const reply = Array.isArray(data.replies) ? data.replies[0] as JsonMap : {};
+      const sheetProps = reply.addSheet?.properties as JsonMap | undefined;
+      const sheetId = sheetProps?.sheetId;
+
+      return {
+        content: [{ type: "text", text: `Created sheet: ${params.title} (ID: ${sheetId})` }],
+        details: { spreadsheetId: params.spreadsheetId, title: params.title, sheetId },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_sheets_delete_sheet",
+    label: "Google Sheets Delete Sheet",
+    description: "Delete a sheet/tab from a spreadsheet.",
+    promptSnippet: "Remove a sheet tab from a spreadsheet.",
+    parameters: Type.Object({
+      spreadsheetId: Type.String({ description: "Spreadsheet ID" }),
+      sheetId: Type.Integer({ description: "Sheet ID to delete" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      await googleRequest(`/v4/spreadsheets/${encodeURIComponent(params.spreadsheetId)}:batchUpdate`, {
+        method: "POST",
+        body: {
+          requests: [{
+            deleteSheet: { sheetId: params.sheetId },
+          }],
+        },
+        signal,
+      });
+
+      return {
+        content: [{ type: "text", text: `Deleted sheet ID: ${params.sheetId}` }],
+        details: { spreadsheetId: params.spreadsheetId, sheetId: params.sheetId },
       };
     },
   });
@@ -1282,6 +1574,186 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: `Replaced ${occurrencesChanged} occurrence(s) of '${params.findText}' with '${params.replaceText}'. (documentId=${params.documentId})` }],
         details: { documentId: params.documentId, findText: params.findText, replaceText: params.replaceText, occurrencesChanged },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_docs_insert_table",
+    label: "Google Docs Insert Table",
+    description: "Insert a table at a specific position in a Google Docs document.",
+    promptSnippet: "Insert a table at a specific index in a Google Docs document.",
+    parameters: Type.Object({
+      documentId: Type.String({ description: "Google Docs document ID" }),
+      index: Type.Integer({ description: "Index position to insert table at" }),
+      rows: Type.Integer({ description: "Number of rows" }),
+      columns: Type.Integer({ description: "Number of columns" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest(`/v1/documents/${encodeURIComponent(params.documentId)}:batchUpdate`, {
+        method: "POST",
+        body: {
+          requests: [
+            {
+              insertTable: {
+                location: { index: Math.max(1, params.index) },
+                tableRows: params.rows,
+                columns: params.columns,
+              },
+            },
+          ],
+        },
+        signal,
+      });
+
+      return {
+        content: [{ type: "text", text: `Inserted ${params.rows}x${params.columns} table at index ${params.index}.` }],
+        details: { documentId: params.documentId, rows: params.rows, columns: params.columns, index: params.index },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_docs_insert_page_break",
+    label: "Google Docs Insert Page Break",
+    description: "Insert a page break at a specific position in a Google Docs document.",
+    promptSnippet: "Insert a page break at a specific index.",
+    parameters: Type.Object({
+      documentId: Type.String({ description: "Google Docs document ID" }),
+      index: Type.Integer({ description: "Index position to insert page break" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest(`/v1/documents/${encodeURIComponent(params.documentId)}:batchUpdate`, {
+        method: "POST",
+        body: {
+          requests: [
+            {
+              insertPageBreak: {
+                location: { index: Math.max(1, params.index) },
+              },
+            },
+          ],
+        },
+        signal,
+      });
+
+      return {
+        content: [{ type: "text", text: `Inserted page break at index ${params.index}.` }],
+        details: { documentId: params.documentId, index: params.index },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_docs_update_header",
+    label: "Google Docs Update Header",
+    description: "Update the header text of a Google Docs document.",
+    promptSnippet: "Set or update the header text of a document.",
+    parameters: Type.Object({
+      documentId: Type.String({ description: "Google Docs document ID" }),
+      text: Type.String({ description: "Header text" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest(`/v1/documents/${encodeURIComponent(params.documentId)}:batchUpdate`, {
+        method: "POST",
+        body: {
+          requests: [
+            {
+              updateDocumentStyle: {
+                style: {
+                  customHeader: true,
+                },
+                fields: "customHeader",
+              },
+            },
+            {
+              updateParagraphStyle: {
+                range: { startIndex: 0, endIndex: 1 },
+                style: { namedStyleType: "HEADER" },
+                fields: "namedStyleType",
+              },
+            },
+          ],
+        },
+        signal,
+      });
+
+      return {
+        content: [{ type: "text", text: `Updated header: ${params.text}` }],
+        details: { documentId: params.documentId, header: params.text },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_docs_batch_update",
+    label: "Google Docs Batch Update",
+    description: "Execute multiple operations in a single batch update request.",
+    promptSnippet: "Execute multiple insert/delete/format operations in one request.",
+    parameters: Type.Object({
+      documentId: Type.String({ description: "Google Docs document ID" }),
+      operations: Type.Array(Type.Any(), { description: "Array of operations to execute" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const requests = params.operations.map((op: JsonMap) => {
+        const type = op.type as string;
+        switch (type) {
+          case "insertText":
+            return { insertText: { location: { index: op.index ?? 1 }, text: op.text as string } };
+          case "deleteText":
+            return { deleteContentRange: { range: { startIndex: op.startIndex, endIndex: op.endIndex } } };
+          case "insertTable":
+            return { insertTable: { location: { index: op.index ?? 1 }, tableRows: op.rows, columns: op.columns } };
+          case "insertPageBreak":
+            return { insertPageBreak: { location: { index: op.index ?? 1 } } };
+          case "updateParagraphStyle":
+            return { updateParagraphStyle: { range: { startIndex: op.startIndex, endIndex: op.endIndex }, style: op.style, fields: op.fields ?? "*" } };
+          default:
+            return op;
+        }
+      });
+
+      const data = await googleRequest(`/v1/documents/${encodeURIComponent(params.documentId)}:batchUpdate`, {
+        method: "POST",
+        body: { requests },
+        signal,
+      });
+
+      return {
+        content: [{ type: "text", text: `Batch update completed. ${requests.length} operations executed.` }],
+        details: { documentId: params.documentId, operationCount: requests.length, replies: data.replies },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "google_docs_delete_content",
+    label: "Google Docs Delete Content",
+    description: "Delete content from a specific range in a Google Docs document.",
+    promptSnippet: "Delete text or elements from a document at specific indices.",
+    parameters: Type.Object({
+      documentId: Type.String({ description: "Google Docs document ID" }),
+      startIndex: Type.Integer({ description: "Start index of content to delete" }),
+      endIndex: Type.Integer({ description: "End index of content to delete" }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const data = await googleRequest(`/v1/documents/${encodeURIComponent(params.documentId)}:batchUpdate`, {
+        method: "POST",
+        body: {
+          requests: [
+            {
+              deleteContentRange: {
+                range: { startIndex: params.startIndex, endIndex: params.endIndex },
+              },
+            },
+          ],
+        },
+        signal,
+      });
+
+      return {
+        content: [{ type: "text", text: `Deleted content from index ${params.startIndex} to ${params.endIndex}.` }],
+        details: { documentId: params.documentId, startIndex: params.startIndex, endIndex: params.endIndex },
       };
     },
   });
