@@ -1,0 +1,39 @@
+{
+  "name": "@steimbyte/st-gws-pi",
+  "version": "1.1.0",
+  "description": "Enhanced Google Workspace extension for pi with insert_text and find_replace",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/steimbyte/st-gws-pi.git"
+  },
+  "homepage": "https://github.com/steimbyte/st-gws-pi#readme",
+  "bugs": {
+    "url": "https://github.com/steimbyte/st-gws-pi/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "google-workspace",
+    "google-docs",
+    "google-drive",
+    "google-sheets",
+    "google-slides"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "google-workspace.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
