@@ -1625,7 +1625,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
             {
               insertTable: {
                 location: { index: Math.max(1, params.index) },
-                tableRows: params.rows,
+                rows: params.rows,
                 columns: params.columns,
               },
             },
@@ -1731,7 +1731,7 @@ export default function googleWorkspaceExtension(pi: ExtensionAPI) {
           case "deleteText":
             return { deleteContentRange: { range: { startIndex: op.startIndex, endIndex: op.endIndex } } };
           case "insertTable":
-            return { insertTable: { location: { index: op.index ?? 1 }, tableRows: op.rows, columns: op.columns } };
+            return { insertTable: { location: { index: op.index ?? 1 }, rows: op.rows, columns: op.columns } };
           case "insertPageBreak":
             return { insertPageBreak: { location: { index: op.index ?? 1 } } };
           case "updateParagraphStyle":
